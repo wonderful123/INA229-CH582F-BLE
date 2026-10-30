@@ -1,0 +1,347 @@
+#include <array>
+#include <chrono>
+#include <cstdint>
+
+#include "BLE/Ch58xBleAdvertiser.h"
+#include "Hardware/CH582F/CH582FGpioOutput.hpp"
+#include "Hardware/CH582F/CH582FSpi.hpp"
+#include "Hardware/PowerSensors.hpp"
+#include "Hardware/Sensor/Ina229SpiAdapter.hpp"
+#include "PowerPayload.h"
+#include "System/Ch58xPlatform.h"
+
+extern "C" {
+#include "CH58x_common.h"
+#include "CH58xBLE_LIB.H"
+}
+
+// 0 = normal operation
+// 1 = raw register dump of all three INA229s (no init, no checking)
+// 2 = pin walk: holds one signal at a time for a multimeter
+// 3 = raw frames and bus pattern test (no init, no checking)
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 3
+#endif
+
+// 1 = re-apply the SPI and CS pin setup before every update (normal mode).
+#ifndef REINIT_EACH_CYCLE
+#define REINIT_EACH_CYCLE 1
+#endif
+
+namespace {
+
+constexpr uint32_t kSensorUpdateTicks = 1600; // 1 second
+constexpr uint32_t kMaxSleepTicks = 80;       // 50 ms
+
+constexpr uint32_t kSolarCsPin = GPIO_Pin_10;
+constexpr uint32_t kBatteryCsPin = GPIO_Pin_11;
+constexpr uint32_t kLoadCsPin = GPIO_Pin_12;
+
+constexpr std::array<uint8_t, 3> kScanResponse = {0x02, 0x0A, 0x00};
+
+using CsPin = Hardware::CH582FGpioOutput<Hardware::CH582Port::PortA>;
+
+// Bundles the pin-owning objects so their setup can be re-applied.
+struct Board {
+  Hardware::CH582FSpi &spi;
+  CsPin &solarCs;
+  CsPin &batteryCs;
+  CsPin &loadCs;
+
+  void reinit() {
+    spi.init();
+    solarCs.init();
+    batteryCs.init();
+    loadCs.init();
+  }
+};
+
+uint32_t tmos_to_rtc_ticks(uint32_t ticks) noexcept {
+  return (ticks * 512u) / 25u;
+}
+
+void sleep_until_next_event(uint32_t elapsedTicks) {
+  const uint32_t remaining = kSensorUpdateTicks - elapsedTicks;
+
+  const uint32_t sleepTicks =
+      remaining < kMaxSleepTicks ? remaining : kMaxSleepTicks;
+
+  if (sleepTicks != 0) {
+    Ch58xPlatform::sleep_ticks(tmos_to_rtc_ticks(sleepTicks));
+  }
+}
+
+#if DEBUG_MODE == 1
+
+// INA229 registers read in this mode.
+constexpr uint8_t kRegConfig = 0x00;
+constexpr uint8_t kRegAdcConfig = 0x01;
+constexpr uint8_t kRegManufacturerId = 0x3E;
+constexpr uint8_t kRegDeviceId = 0x3F;
+
+// INA229 read command = (register address << 2) | 1.
+constexpr uint8_t read_cmd(uint8_t reg) {
+  return static_cast<uint8_t>((reg << 2) | 0x01);
+}
+
+// Reads a 16-bit register and writes the two raw bytes, as received
+// (most significant byte first), to dest[0] and dest[1].
+void read_raw16(Hardware::Ina229SpiAdapter &spi, uint8_t reg, uint8_t *dest) {
+  spi.read(read_cmd(reg), dest, 2);
+}
+
+// Raw dump packet (AD structure, 30 bytes). Bytes after "FF FF":
+//   E7        marker
+//   cc        counter, +1 every second
+//   solar:    mfr ID (2), device ID (2), CONFIG (2), ADC_CONFIG (2)
+//   battery:  same 8 bytes
+//   load:     same 8 bytes
+// Expected from a healthy, freshly reset chip:
+//   54 49  22 9x  00 00  FB 68
+void update_raw_dump(Ch58xBleAdvertiser &advertiser,
+                     const std::array<Hardware::Ina229SpiAdapter *, 3> &chips,
+                     uint8_t counter) {
+  std::array<uint8_t, 30> packet{};
+
+  packet[0] = 29;
+  packet[1] = 0xFF;
+  packet[2] = 0xFF;
+  packet[3] = 0xFF;
+  packet[4] = 0xE7;
+  packet[5] = counter;
+
+  for (size_t c = 0; c < chips.size(); ++c) {
+    uint8_t *out = &packet[6 + c * 8];
+
+    read_raw16(*chips[c], kRegManufacturerId, out);
+    read_raw16(*chips[c], kRegDeviceId, out + 2);
+    read_raw16(*chips[c], kRegConfig, out + 4);
+    read_raw16(*chips[c], kRegAdcConfig, out + 6);
+  }
+
+  advertiser.set_payload(AdvPayloadType::AdvertisingData,
+                         {packet.data(), packet.size()});
+}
+
+#elif DEBUG_MODE == 2
+
+constexpr uint32_t kSecondsPerState = 4;
+constexpr uint32_t kStateCount = 6;
+
+// Pin walk. Each state lasts kSecondsPerState seconds, then the next starts:
+//   0  idle: SCK low, MOSI low, all CS high
+//   1  SCK  (PB13) held HIGH, everything else idle
+//   2  MOSI (PB15) held HIGH, everything else idle
+//   3  solar   CS (PA10) held LOW, everything else idle
+//   4  battery CS (PA11) held LOW, everything else idle
+//   5  load    CS (PA12) held LOW, everything else idle
+void apply_state(Board &board, uint8_t state) {
+  GPIOB_ResetBits(Hardware::CH582FSpi::kSckPin |
+                  Hardware::CH582FSpi::kMosiPin);
+  board.solarCs.setHigh();
+  board.batteryCs.setHigh();
+  board.loadCs.setHigh();
+
+  switch (state) {
+  case 1:
+    GPIOB_SetBits(Hardware::CH582FSpi::kSckPin);
+    break;
+  case 2:
+    GPIOB_SetBits(Hardware::CH582FSpi::kMosiPin);
+    break;
+  case 3:
+    board.solarCs.setLow();
+    break;
+  case 4:
+    board.batteryCs.setLow();
+    break;
+  case 5:
+    board.loadCs.setLow();
+    break;
+  default:
+    break;
+  }
+}
+
+// Packet (AD structure, 7 bytes): [len=6][FF][FF FF][E5][state][tick]
+void update_pin_walk(Ch58xBleAdvertiser &advertiser, Board &board,
+                     uint32_t tick) {
+  const uint8_t state =
+      static_cast<uint8_t>((tick / kSecondsPerState) % kStateCount);
+
+  apply_state(board, state);
+
+  const std::array<uint8_t, 7> packet = {
+      6, 0xFF, 0xFF, 0xFF, 0xE5, state, static_cast<uint8_t>(tick)};
+
+  advertiser.set_payload(AdvPayloadType::AdvertisingData,
+                         {packet.data(), packet.size()});
+}
+
+#elif DEBUG_MODE == 3
+
+// INA229 read command for the manufacturer ID register (0x3E).
+constexpr uint8_t kCmdReadManufacturerId = (0x3E << 2) | 0x01; // 0xF9
+
+// One SPI frame with an optional chip select. A null cs leaves every chip
+// deselected.
+void raw_frame(Hardware::CH582FSpi &spi, CsPin *cs, const uint8_t *tx,
+               uint8_t *rx, size_t len) {
+  if (cs != nullptr) {
+    cs->setLow();
+    // CS falling setup delay to guarantee INA229 sees SCLK bit 7
+    for (volatile int i = 0; i < 10; ++i) { __asm__ volatile("nop"); }
+  }
+
+  spi.transfer(tx, rx, len);
+
+  if (cs != nullptr) {
+    for (volatile int i = 0; i < 10; ++i) { __asm__ volatile("nop"); }
+    cs->setHigh();
+  }
+}
+
+// Raw frame packet (AD structure, 19 bytes). Bytes after "FF FF":
+//   E8        marker
+//   cc        counter, +1 every second
+//   4 bytes   pattern test: A5 5A F9 FF sent with every CS high,
+//             and the raw bytes received
+//   3 bytes   solar   frame: sent F9 FF FF, raw bytes received
+//   3 bytes   battery frame: same
+//   3 bytes   load    frame: same
+// Pattern test:
+//   FF FF FF FF  nothing drives MISO (chips deselected or not connected)
+//   A5 5A F9 FF  MISO is jumpered to MOSI (loopback)
+//   00 00 00 00  MISO is held low
+// Chip frames: bytes 2 and 3 should be 54 49 from a working chip.
+void update_raw_frames(Ch58xBleAdvertiser &advertiser, Board &board,
+                       uint8_t counter) {
+  std::array<uint8_t, 19> packet{};
+
+  packet[0] = 18;
+  packet[1] = 0xFF;
+  packet[2] = 0xFF;
+  packet[3] = 0xFF;
+  packet[4] = 0xE8;
+  packet[5] = counter;
+
+  const std::array<uint8_t, 4> pattern = {0xA5, 0x5A, 0xF9, 0xFF};
+  raw_frame(board.spi, nullptr, pattern.data(), &packet[6], pattern.size());
+
+  const std::array<uint8_t, 3> readCmd = {kCmdReadManufacturerId, 0xFF, 0xFF};
+  CsPin *channels[3] = {&board.solarCs, &board.batteryCs, &board.loadCs};
+
+  for (size_t c = 0; c < 3; ++c) {
+    raw_frame(board.spi, channels[c], readCmd.data(), &packet[10 + c * 3],
+              readCmd.size());
+  }
+
+  advertiser.set_payload(AdvPayloadType::AdvertisingData,
+                         {packet.data(), packet.size()});
+}
+
+#else
+
+void update_advertisement(Ch58xBleAdvertiser &advertiser, Board &board,
+                          const Hardware::PowerSensors &sensors) {
+#if REINIT_EACH_CYCLE
+  board.reinit();
+#else
+  (void)board;
+#endif
+
+  // The payload is a complete AD structure: [length][0xFF][company ID]...
+  const auto payload = PowerPayload::build(sensors);
+
+  if (!payload.ok()) {
+    return;
+  }
+
+  advertiser.set_payload(AdvPayloadType::AdvertisingData,
+                         {payload.data(), payload.size()});
+}
+
+#endif
+
+} // namespace
+
+int main() {
+  SetSysClock(CLK_SOURCE_PLL_60MHz);
+  Ch58xPlatform::init_system();
+
+  Hardware::CH582FSpi spi;
+  CsPin solarCs{kSolarCsPin};
+  CsPin batteryCs{kBatteryCsPin};
+  CsPin loadCs{kLoadCsPin};
+
+  Board board{spi, solarCs, batteryCs, loadCs};
+  board.reinit();
+
+  Hardware::Ina229SpiAdapter solarSpi{spi, solarCs};
+  Hardware::Ina229SpiAdapter batterySpi{spi, batteryCs};
+  Hardware::Ina229SpiAdapter loadSpi{spi, loadCs};
+
+  Hardware::PowerSensors sensors{
+      Hardware::PowerBuses{solarSpi, batterySpi, loadSpi}};
+
+#if DEBUG_MODE == 0
+  // A failed init does not stop the firmware, so the device stays visible.
+  const bool initOk = sensors.init();
+  (void)initOk;
+#else
+  // Debug modes leave the chips at their power-up defaults.
+  (void)sensors;
+#endif
+
+  Ch58xBleAdvertiser advertiser;
+  advertiser.init();
+  advertiser.set_interval(std::chrono::milliseconds{100});
+
+#if DEBUG_MODE == 1
+  const std::array<Hardware::Ina229SpiAdapter *, 3> chips = {
+      &solarSpi, &batterySpi, &loadSpi};
+  uint8_t counter = 0;
+  update_raw_dump(advertiser, chips, counter);
+#elif DEBUG_MODE == 2
+  uint32_t tick = 0;
+  update_pin_walk(advertiser, board, tick);
+#elif DEBUG_MODE == 3
+  uint8_t counter = 0;
+  update_raw_frames(advertiser, board, counter);
+#else
+  update_advertisement(advertiser, board, sensors);
+#endif
+
+  advertiser.set_payload(AdvPayloadType::ScanResponseData, kScanResponse);
+  advertiser.start();
+
+  uint32_t lastUpdate = TMOS_GetSystemClock();
+
+  while (true) {
+    TMOS_SystemProcess();
+
+    const uint32_t now = TMOS_GetSystemClock();
+    const uint32_t elapsed = static_cast<uint32_t>(now - lastUpdate);
+
+    if (elapsed >= kSensorUpdateTicks) {
+      lastUpdate = now;
+
+#if DEBUG_MODE == 1
+      ++counter;
+      update_raw_dump(advertiser, chips, counter);
+#elif DEBUG_MODE == 2
+      ++tick;
+      update_pin_walk(advertiser, board, tick);
+#elif DEBUG_MODE == 3
+      ++counter;
+      update_raw_frames(advertiser, board, counter);
+#else
+      update_advertisement(advertiser, board, sensors);
+#endif
+
+      continue;
+    }
+
+    sleep_until_next_event(elapsed);
+  }
+}

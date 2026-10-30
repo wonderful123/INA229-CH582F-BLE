@@ -1,0 +1,36 @@
+{
+  "build": {
+    "clock_source": "hsi+pll",
+    "core": "ch58x",
+    "cpu": "riscv",
+    "extra_flags": "-DCH582 -DCH58X",
+    "f_cpu": "60000000L",
+    "mabi": "ilp32",
+    "march": "rv32imac",
+    "mcu": "ch582f",
+    "series": "ch58x",
+    "spl_series": "ch58x",
+    "variant": "CH583"
+  },
+  "debug": {
+    "onboard_tools": [
+      "wch-link"
+    ],
+    "openocd_target": "wch-riscv"
+  },
+  "frameworks": [
+    "noneos-sdk"
+  ],
+  "name": "WCH CH582F",
+  "upload": {
+    "maximum_ram_size": 32768,
+    "maximum_size": 458752,
+    "protocol": "wch-link",
+    "protocols": [
+      "wch-link",
+      "isp"
+    ]
+  },
+  "url": "http://www.wch.cn/products/CH582.html",
+  "vendor": "WCH"
+}
